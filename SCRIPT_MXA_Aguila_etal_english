@@ -1,0 +1,589 @@
+# =====================================================================
+# Aguila et al. — Analysis Script (reviewer-friendly, documented)
+# Packages: phyloseq, vegan, ampvis2, indicspecies, ggplot2, etc.
+# This script builds a phyloseq object, explores beta/alpha diversity,
+# renders relative-abundance barplots, and generates ampvis2 heatmap
+# and PCA. Minor safe fixes were applied (see notes above).
+# =====================================================================
+
+# ----------------------------
+# 0) Libraries and working dir
+# ----------------------------
+library(ampvis2)
+library(BiocManager)
+library(ggplot2)
+library(dplyr)
+library(phyloseq)
+library(ranacapa)
+library(readxl)
+library(tidyverse)
+library(vegan)
+library(psadd)
+library(ape)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(stringr)
+library(iNEXT)
+
+# NOTE: Hard-coded setwd(). Keep if you prefer, but consider using
+# a project root + relative paths to improve portability.
+setwd("C:/Users/ST/Desktop/CORRECCIONES BIOTROPICA R ANALYSIS")
+
+# -------------------------------------------------------------
+# 1) Import raw tables and construct a phyloseq object (MX55)
+# -------------------------------------------------------------
+# Input files expected in the current working directory:
+#   MX55_table.txt            (OTU table; rows = taxa/OTUs; columns = samples)
+#   MX55_clasification.txt    (taxonomy; rows = taxa/OTUs; columns = ranks)
+#   MX55_metadata.txt         (sample metadata; rows = samples; columns = vars)
+
+# 1.1 Read as data frames (keep names as-is)
+otu_mat  <- read.delim("MX55_table.txt",          row.names = 1, check.names = FALSE)
+tax_mat  <- read.delim("MX55_clasification.txt",  row.names = 1, check.names = FALSE)
+samples_df <- read.delim("MX55_metadata.txt",     row.names = 1, check.names = FALSE)
+
+# 1.2 Coerce to matrices (phyloseq requires matrix for OTU/tax_table)
+otu_mat <- as.matrix(otu_mat)
+tax_mat <- as.matrix(tax_mat)
+
+# 1.3 Build phyloseq components (use explicit namespaces to avoid conflicts)
+OTU     <- phyloseq::otu_table(otu_mat, taxa_are_rows = TRUE)
+TAX     <- phyloseq::tax_table(tax_mat)
+SAMPLES <- phyloseq::sample_data(samples_df)
+
+# 1.4 Compose the full phyloseq object
+MX55 <- phyloseq::phyloseq(OTU, TAX, SAMPLES)
+
+# 1.5 Basic cleaning: drop synthetic mock sample (if present) and zero-sum taxa
+MX55 <- phyloseq::prune_samples(phyloseq::sample_names(MX55) != "Mock", MX55)
+MX55 <- phyloseq::prune_taxa(phyloseq::taxa_sums(MX55) > 0, MX55)
+MX55  # print summary
+
+# ---------------------------------------------------------------
+# 2) Second phyloseq: same OTU/tax but numeric-only sample data
+# ---------------------------------------------------------------
+# Rationale: some multivariate steps benefit from a metadata view
+# restricted to numeric predictors (keeps factors out).
+metadata_numeric <- samples_df %>%
+  dplyr::select(name, where(is.numeric))
+head(metadata_numeric)
+
+SAMPLESn <- phyloseq::sample_data(metadata_numeric)
+MX55n    <- phyloseq::phyloseq(OTU, TAX, SAMPLESn)
+MX55n
+
+# -----------------------------------------------------
+# 3) Third phyloseq: samples merged by Bray_Group level
+# -----------------------------------------------------
+# Group-wise aggregation: sums reads per Bray_Group (Ward figures, etc.)
+MX55_byBray <- phyloseq::merge_samples(MX55, group = "Bray_Group", fun = sum)
+
+# Make the sample names equal to the Bray_Group factor levels for clarity
+phyloseq::sample_data(MX55_byBray)$Bray_Group <- factor(phyloseq::sample_names(MX55_byBray))
+phyloseq::sample_names(MX55_byBray) <- as.character(phyloseq::sample_data(MX55_byBray)$Bray_Group)
+
+# Drop zero-sum taxa after aggregation
+MX55_byBray <- phyloseq::prune_taxa(phyloseq::taxa_sums(MX55_byBray) > 0, MX55_byBray)
+MX55_byBray
+
+# -----------------------------
+# 4) Beta-diversity exploration
+# -----------------------------
+# Bray-Curtis clustering on samples
+d  <- phyloseq::distance(MX55, method = "bray")
+plot(hclust(d, method = "ward"), xlab = "bray_curtis")
+
+# Jaccard clustering on Bray-group aggregates
+d1 <- phyloseq::distance(MX55_byBray, method = "jaccard")
+plot(hclust(d1, method = "ward"), xlab = "jaccard")
+
+# Export Newick tree (Bray/ward) and a quick distance heatmap
+hc      <- hclust(d, method = "ward")
+my_tree <- as.phylo(hc)
+ape::write.tree(phy = my_tree, file = "bray_tree.newick")
+heatmap(as.matrix(d), xlab = "bray_curtis")
+
+# --------------------------------------------------------------
+# 5) Relative-abundance barplots (genus & primary_lifestyle)
+# --------------------------------------------------------------
+# Palette for stacked bars
+phylum_colors <- c(
+  "purple","red","#009E73","orange","#FF2F80","red4","blue","#CBD588","#FC8E00","cyan",
+  "#652CFF","maroon4","#575329","#1E6E00","#320033","#66E1D3","#CFCDAC","#4FC601",
+  "#4A3B53","#00FECF","#B05B6F","#8CD0FF","darkgrey","#F6E442","#04F757","#FFAA92",
+  "#FF90C9","#B903AA","#C8A1A1","royalblue4","#CBD588","#61615A","#BA0900","#6B7900",
+  "#00C2A0","#D16100","#575329","#04F757","#C8A1A1","#1E6E00","#A77500","#6367A9",
+  "#A05837","#6B002C","#772600","#D790FF","#9B9700","#3B5DFF","#549E79","#7B4F4B",
+  "#A1C299","purple","#999999","#E69F00","#009E73","darkgrey","#FC4E07","#652926",
+  "red4","#009E73","#00BA38","#252A52","brown","#D55E00","#5F7FC7"
+)
+
+# 5.1 Genus-level stacked relative abundance by Bray_Group (threshold = 5%)
+MX <- MX55 %>%
+  phyloseq::tax_glom(taxrank = "genus") %>%     # agglomerate at genus level
+  phyloseq::transform_sample_counts(function(x) x / sum(x)) %>%  # relative abundances
+  phyloseq::psmelt() %>%                        # long format
+  dplyr::filter(Abundance > 0.05) %>%           # keep taxa >5%
+  dplyr::arrange(order)
+
+Z <- ggplot(MX, aes(x = name, y = Abundance, fill = order)) +
+  geom_bar(stat = "identity", position = "Fill") +
+  scale_fill_manual(values = phylum_colors) +
+  theme(axis.title.x = element_blank()) +
+  guides(fill = guide_legend(reverse = FALSE, keywidth = 1, keyheight = 1)) +
+  ylab("Relative Abundance (Phyla > 5%)\n") +
+  ggtitle("abundance_MX55") +
+  theme(axis.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  facet_grid(~Bray_Group, scales = "free", space = "free")
+Z
+
+# 5.2 Primary lifestyle stacked relative abundance by Bray_Group (threshold = 1%)
+MX <- MX55 %>%
+  phyloseq::tax_glom(taxrank = "primary_lifestyle") %>%
+  phyloseq::transform_sample_counts(function(x) x / sum(x)) %>%
+  phyloseq::psmelt() %>%
+  dplyr::filter(Abundance > 0.01) %>%
+  dplyr::arrange(primary_lifestyle)
+
+Z <- ggplot(MX, aes(x = name, y = Abundance, fill = primary_lifestyle)) +
+  geom_bar(stat = "identity", position = "Fill") +
+  scale_fill_manual(values = phylum_colors) +
+  theme(axis.title.x = element_blank()) +
+  guides(fill = guide_legend(reverse = FALSE, keywidth = 1, keyheight = 1)) +
+  ylab("Relative Abundance (Phyla > 1%)\n") +
+  ggtitle("Primary_lifestyle_abundance_MX55") +
+  theme(axis.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  facet_grid(~Bray_Group, scales = "free", space = "free")
+Z
+
+# --------------------------------------------
+# 6) Alpha-diversity indices per sample/group
+# --------------------------------------------
+# 6.1 Per-sample alpha metrics
+# NOTE: 'plot_richness' aesthetics ('sample', 'bioregion') depend on your metadata;
+# keep as-is but adjust if your column names differ.
+alpha_meas <- c("Observed")  # can add "Shannon", etc.
+(p <- plot_richness(MX55, "sample", color = "bioregion", measures = alpha_meas))
+
+rich <- estimate_richness(MX55)
+rich
+write.csv(rich, file = "tabla_diversidad.csv")
+
+# 6.2 Compute Observed/Shannon/Simpson/Pielou and export per sample
+stopifnot(inherits(MX55, "phyloseq"))
+otu <- as(phyloseq::otu_table(MX55), "matrix")
+if (phyloseq::taxa_are_rows(MX55)) otu <- t(otu)
+
+# Make counts integer, non-negative
+if (!is.integer(otu)) otu <- round(otu, 0)
+otu[otu < 0 | is.na(otu)] <- 0
+mode(otu) <- "integer"
+
+Observed <- vegan::specnumber(otu)
+Shannon  <- vegan::diversity(otu, index = "shannon")
+Simpson  <- vegan::diversity(otu, index = "simpson")   # Gini–Simpson (1 - D)
+Pielou   <- ifelse(Observed > 1, Shannon / log(Observed), NA_real_)
+
+meta_df <- as.data.frame(phyloseq::sample_data(MX55), stringsAsFactors = FALSE, optional = TRUE)
+meta_df$SampleID <- rownames(meta_df)
+
+alpha_tbl <- tibble::tibble(
+  SampleID = rownames(otu),
+  Observed = Observed,
+  Shannon  = Shannon,
+  Simpson  = Simpson,
+  Pielou   = Pielou
+)
+
+# Export per-sample table
+readr::write_csv(alpha_tbl,
+                 "alpha_diversity_per_sample_Observed_Shannon_Simpson_Pielou_BrayGroup.csv")
+
+# 6.3 Group-level (Bray_Group) means/SD/SE — reads the just-exported file
+alpha_samples <- readr::read_csv(
+  "alpha_diversity_per_sample_Observed_Shannon_Simpson_Pielou_BrayGroup.csv",
+  show_col_types = FALSE
+)
+
+# Expect these columns present (merge your Bray_Group later if needed)
+# If Bray_Group is missing in the CSV, join with metadata first.
+if (!"Bray_Group" %in% names(alpha_samples)) {
+  alpha_samples <- alpha_samples %>%
+    dplyr::left_join(meta_df[, c("SampleID","Bray_Group")], by = "SampleID")
+}
+
+req_cols <- c("SampleID","Bray_Group","Observed","Shannon","Simpson","Pielou")
+stopifnot(all(req_cols %in% names(alpha_samples)))
+
+num_cols <- c("Observed","Shannon","Simpson","Pielou")
+alpha_samples <- alpha_samples %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(num_cols), ~ suppressWarnings(as.numeric(.))))
+
+alpha_by_group <- alpha_samples %>%
+  dplyr::filter(!is.na(Bray_Group) & Bray_Group != "") %>%
+  dplyr::group_by(Bray_Group) %>%
+  dplyr::summarise(
+    n             = dplyr::n(),
+    Observed_mean = mean(Observed, na.rm = TRUE),  Observed_sd = sd(Observed, na.rm = TRUE),
+    Observed_se   = Observed_sd / sqrt(n),
+    Shannon_mean  = mean(Shannon,  na.rm = TRUE),  Shannon_sd  = sd(Shannon,  na.rm = TRUE),
+    Shannon_se    = Shannon_sd / sqrt(n),
+    Simpson_mean  = mean(Simpson,  na.rm = TRUE),  Simpson_sd  = sd(Simpson,  na.rm = TRUE),
+    Simpson_se    = Simpson_sd / sqrt(n),
+    Pielou_mean   = mean(Pielou,   na.rm = TRUE),  Pielou_sd   = sd(Pielou,   na.rm = TRUE),
+    Pielou_se     = Pielou_sd / sqrt(n),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(.ord = readr::parse_number(Bray_Group)) %>%
+  dplyr::arrange(.ord, Bray_Group) %>%
+  dplyr::select(-.ord)
+
+readr::write_csv(alpha_by_group, "alpha_diversity_by_Bray_Group_mean_sd.csv")
+alpha_by_group
+
+# ------------------------------------------------------------
+# 7) ampvis2 conversion (from phyloseq) + heatmap and PCA
+# ------------------------------------------------------------
+# Convert phyloseq → ampvis2-friendly tables (abundances + taxonomy)
+# NOTE: The two lines below were text in Spanish without '#' and broke execution.
+#       They are kept as comments for clarity of intent.
+# "Convertir de phyloseq (solo metadatos numericos) a ampvis"
+# "Preparar OTU table"
+
+otu_mat_df <- as.data.frame(phyloseq::otu_table(MX55))  # OTUs in rows
+av2_otutable <- data.frame(
+  OTU = rownames(otu_mat_df),
+  otu_mat_df,
+  as.data.frame(phyloseq::tax_table(MX55)),
+  check.names = FALSE
+)
+
+# Prepare metadata for ampvis2
+av2_metadata <- data.frame(phyloseq::sample_data(MX55), check.names = FALSE)
+av2_metadata$SampleID <- rownames(av2_metadata)
+
+# Build ampvis2 object
+av2_obj <- ampvis2::amp_load(
+  otutable = av2_otutable,
+  metadata = av2_metadata
+)
+
+# Quick rank-abundance plot (sanity check)
+ampvis2::amp_rankabundance(av2_obj, group_by = "SampleID")
+
+# Rarefaction curves (optional)
+ampvis2::amp_rarecurve(av2_obj, stepsize = 1000, color_by = "sample", facet_scales = "fixed")
+
+# Alternative rarefaction (faceted by ecoregion; requires that column in metadata)
+ampvis2::amp_rarefaction_curve(
+  av2_obj,
+  stepsize = 1000,
+  color_by = "sample",
+  facet_by = "ecoregion",   # change to a valid field if needed
+  facet_scales = "fixed"
+)
+
+# Heatmap (top-20 taxa). Use 'genus' (lowercase, consistent with your taxonomy),
+# add 'order' as extra label; facet by Bray_Group; group-by SampleID for full detail.
+ampvis2::amp_heatmap(
+  av2_obj,
+  group_by      = "SampleID",
+  facet_by      = "Bray_Group",
+  tax_aggregate = "genus",
+  tax_add       = "order",
+  tax_show      = 20,
+  color_vector  = c("white", "blue"),
+  plot_colorscale = "sqrt",
+  plot_values   = TRUE
+)
+
+# Alternative heatmap at species level
+ampvis2::amp_heatmap(
+  av2_obj,
+  group_by      = "SampleID",
+  facet_by      = "Bray_Group",
+  tax_aggregate = "species",
+  # tax_add     = "order",
+  tax_show      = 50,
+  color_vector  = c("white", "blue"),
+  plot_colorscale = "sqrt",
+  plot_values   = FALSE
+) +
+  theme(axis.text.x = element_text(angle = 45, size = 12, vjust = 1),
+        axis.text.y = element_text(size = 12),
+        legend.position = "left")
+
+# PCA (community; log transform). Color/frame by Bray_Group.
+ampvis2::amp_ordinate(
+  data = av2_obj,
+  type = "PCA",
+  transform = "log",              # you can try "hellinger" too
+  sample_color_by = "Bray_Group",
+  sample_colorframe_label = "sample",
+  sample_colorframe = TRUE
+)
+
+# CA (Correspondence Analysis) — optional
+ampvis2::amp_ordinate(
+  data = av2_obj,
+  type = "ca",
+  sample_color_by = "Bray_Group",
+  sample_colorframe = FALSE,
+  sample_colorframe_label = "sample"
+)
+
+# ------------------------------------------------------------
+# 8) (Optional) Kruskal–Wallis screening across Bray_Group
+# ------------------------------------------------------------
+# Quickly test numeric metadata vs. Bray_Group
+kruskal_pvals <- sapply(
+  metadata_numeric,
+  function(x) kruskal.test(x ~ av2_metadata$Bray_Group)$p.value
+)
+kruskal_results <- data.frame(
+  Variable = names(kruskal_pvals),
+  P_value  = kruskal_pvals
+) %>% arrange(P_value)
+print(kruskal_results)
+
+# (Example) capscale formula (commented; adjust variable names to your metadata)
+# capscale(bray_dist ~ Altitude + Temperature + Ph + Longitude + Latitude +
+#          Precipitation + delta15N + N_conc + Richness + P_conc, data = metadata)
+
+# ------------------------------------------------------------
+# 9) (Commented) ranacapa rarefaction examples with MX56
+# ------------------------------------------------------------
+# The following block references MX56 and columns not present here (Estado, Localidad, etc.).
+# It is kept for your reference but commented to prevent errors.
+# p1 <- ggrare(MX55, step = 1000, color = "Localidad", label = "sample", se = FALSE) + facet_wrap(~sample)
+# p2 <- ggrare(MX55, step = 1000, color = "ecoregion", label = "sample", se = FALSE) + facet_wrap(~Localidad)
+# p3 <- ggrare(MX55, step = 1000, color = "Estado", label = "sample", se = FALSE) + facet_wrap(~Localidad)
+# p4 <- ggrare(MX55, step = 1000, color = "Localidad", label = "sample", se = FALSE) + facet_wrap(~ecoregion)
+# p5 <- ggrare(MX55, step = 1000, color = "Localidad", label = "sample", se = TRUE)  + facet_wrap(~ecoregion)
+
+# ------------------------------------------------------------
+# 10) Export group means and KRONA-friendly tables (optional)
+# ------------------------------------------------------------
+# NOTE: In this section your original code referenced MX56; I keep MX55 here.
+MX55mean <- phyloseq::merge_samples(MX55, "Bray_Group", fun = mean)
+
+glom_pl <- phyloseq::tax_glom(MX55mean, taxrank = "primary_lifestyle")
+write.csv(glom_pl@tax_table, file = "mean_primary_lifestyle_taxonomy.csv")
+write.csv(glom_pl@otu_table, file = "mean_primary_lifestyle_abundance_table.csv")
+
+# KRONA-style exports (order/family)
+glom_o <- phyloseq::tax_glom(MX55, taxrank = "order")
+write.csv(glom_o@tax_table, file = "order_tax.csv")
+write.csv(glom_o@otu_table, file = "order_table.csv")
+
+glom_f <- phyloseq::tax_glom(MX55, taxrank = "family")
+write.csv(glom_f@tax_table, file = "family_tax.csv")
+write.csv(glom_f@otu_table, file = "family_table.csv")
+
+# ------------------------------------------------------------
+# 11) Correlation analysis (Spearman & Pearson)
+# ------------------------------------------------------------
+# NOTE: Your original code read an external Excel file at a Windows path.
+# I reproduce the logic with the same object names; adjust the path as needed.
+# setwd("D:/Postdoc/1) Programas Bioinformatica/1) R_Studio/MX55/MX55 SPPN")
+# data <- read_excel("D:/.../variables.xlsx")
+
+# Example scaffold (replace 'data' with your actual data.frame):
+# Index <- data.frame(
+#   data$abund, data$richness, data$delta15N, data$N_conc_g_kg, data$P_conc_mg_kg,
+#   data$temperature, data$precipitation, data$altitude, data$ph
+# )
+# corr <- cor(Index, method = "spearman"); write.csv(corr, "correlation_ph.csv")
+# corrplot::corrplot(corr, type = "upper", order = "original", tl.col = "black", tl.srt = 45)
+# corr_matrix <- cor(Index, method = "pearson")
+# corrplot::corrplot(corr_matrix, type = "upper", order = "original", tl.col = "black",
+#                    tl.srt = 45, addCoef.col = "black", number.cex = 0.8, method = "circle")
+# Index <- as.matrix(Index)
+# rcx <- Hmisc::rcorr(Index, type = "spearman")
+# write.csv(as.data.frame(rcx$r), "correlationmatrix_index.csv")
+# write.csv(as.data.frame(rcx$P), "correlationmatrix_index_p.csv")
+
+# ------------------------------------------------------------
+# 12) NMDS + PERMANOVA + envfit (standalone files approach)
+# ------------------------------------------------------------
+# This block uses external pre-processed tables; kept as in your script with guards.
+# Files expected: MX55_table_braycurtis.txt, MX55_metadata_braycurtis.txt
+tab <- read.delim("MX55_table_braycurtis.txt",   row.names = 1, check.names = FALSE)
+env <- read.delim("MX55_metadata_braycurtis.txt", row.names = 1, check.names = FALSE)
+
+if ("SampleID" %in% colnames(env)) {
+  rownames(env) <- env$SampleID
+  env$SampleID <- NULL
+}
+rownames(env) <- trimws(rownames(env))
+colnames(tab) <- trimws(colnames(tab))
+
+all_cols    <- colnames(tab)
+sample_cols <- intersect(all_cols, rownames(env))
+roman_re    <- "^[IVXLCDM]+$"
+agg_cols    <- setdiff(all_cols, rownames(env))
+agg_cols    <- agg_cols[stringr::str_detect(agg_cols, roman_re)]
+stopifnot(length(sample_cols) > 0)
+
+use_cols <- c(rownames(env)[rownames(env) %in% sample_cols], agg_cols)
+tab_use  <- tab[, use_cols, drop = FALSE]
+
+# Community matrix: rows = (samples + aggregates), cols = OTUs
+com <- t(tab_use)
+
+# Metadata scaffold for plotting
+sample_meta <- data.frame(SampleID = rownames(env), Source = "Sample")
+agg_meta    <- if (length(agg_cols) > 0)
+  data.frame(SampleID = agg_cols, Source = "Aggregate") else
+    data.frame(SampleID = character(0), Source = character(0))
+plot_meta <- dplyr::bind_rows(sample_meta, agg_meta)
+rownames(plot_meta) <- plot_meta$SampleID
+if ("Bray_Group" %in% colnames(env)) {
+  plot_meta$Bray_Group <- NA_character_
+  plot_meta$Bray_Group[plot_meta$SampleID %in% rownames(env)] <-
+    as.character(env[plot_meta$SampleID[plot_meta$SampleID %in% rownames(env)], "Bray_Group"])
+  plot_meta$Bray_Group <- factor(plot_meta$Bray_Group)
+}
+plot_meta <- plot_meta[rownames(com), , drop = FALSE]
+
+# Hellinger-like total standardization for NMDS
+m_com <- vegan::decostand(com, method = "total")
+m_com[!is.finite(as.matrix(m_com))] <- 0
+
+# Bray distances + NMDS
+d <- vegan::vegdist(m_com, method = "bray")
+set.seed(123)
+nmds <- vegan::metaMDS(d, k = 2, autotransform = FALSE, trymax = 30, trace = 1)
+
+# Site scores for plotting
+scr <- as.data.frame(scores(nmds, display = "sites"))
+scr$SampleID <- rownames(scr)
+scr <- dplyr::left_join(scr, tibble::rownames_to_column(plot_meta, "SampleID"), by = "SampleID")
+
+# Order Bray_Group if present
+if ("Bray_Group" %in% colnames(scr)) {
+  scr$Bray_Group <- factor(scr$Bray_Group, levels = c("I","II","III","IV","V","VI","VII","VIII"))
+}
+
+p <- ggplot() +
+  geom_point(
+    data = subset(scr, Source == "Sample"),
+    aes(NMDS1, NMDS2, color = Bray_Group),
+    size = 3, alpha = 0.95, show.legend = TRUE
+  ) +
+  geom_point(
+    data = subset(scr, Source == "Aggregate"),
+    aes(NMDS1, NMDS2),
+    shape = 24, size = 4.2, stroke = 0.7, color = "black", fill = "white",
+    show.legend = FALSE
+  ) +
+  geom_text(
+    data = subset(scr, Source == "Aggregate"),
+    aes(NMDS1, NMDS2, label = SampleID),
+    vjust = -0.9, size = 3.5, show.legend = FALSE
+  ) +
+  coord_equal() +
+  theme_classic(base_size = 13) +
+  labs(
+    title    = sprintf("NMDS (k=2) — Stress = %.3f", nmds$stress),
+    subtitle = "Bray–Curtis on all OTUs (samples + aggregates I–VIII)",
+    x = "NMDS1", y = "NMDS2"
+  ) +
+  scale_color_brewer(palette = "Set2", name = "Bray_Group") +
+  guides(color = guide_legend(override.aes = list(shape = 16, size = 3.5, alpha = 1)))
+p
+
+# PERMANOVA + betadisper
+adonis2_res <- vegan::adonis2(d ~ Bray_Group, data = env, permutations = 999)
+adonis2_res
+bd <- vegan::betadisper(d, env$Bray_Group); anova(bd)
+
+# Environmental vectors (adjust variable names to your metadata)
+fit <- vegan::envfit(nmds, env[, c("delta15N","N_conc_g_kg","P_conc_mg_kg","abund","richness","altitude")], permutations = 999)
+fit
+
+# ------------------------------------------------------------
+# 13) RDA biplot (Hellinger) with ggplot2 (expects rda_mod)
+# ------------------------------------------------------------
+# This block assumes you already fitted an RDA model: rda_mod <- vegan::rda(Y_hel ~ ., data = X)
+suppressPackageStartupMessages({
+  library(phyloseq); library(vegan); library(ggplot2)
+})
+library(grid)  # for arrow()
+
+stopifnot(exists("MX55"))
+stopifnot(exists("rda_mod"))
+
+scr_sites <- as.data.frame(scores(rda_mod, display = "sites", scaling = 2))
+scr_vars  <- as.data.frame(scores(rda_mod, display = "bp",    scaling = 2))
+scr_sites$SampleID <- rownames(scr_sites)
+scr_vars$Var <- rownames(scr_vars)
+
+meta_df2 <- as(phyloseq::sample_data(MX55), "data.frame")
+meta_df2$SampleID <- rownames(meta_df2)
+if (!"Bray_Group" %in% names(meta_df2)) {
+  if ("Bray_group" %in% names(meta_df2)) meta_df2$Bray_Group <- meta_df2$Bray_group
+  else stop("Neither 'Bray_Group' nor 'Bray_group' found in sample_data(MX55).")
+}
+scr_sites <- merge(scr_sites, meta_df2[, c("SampleID","Bray_Group")], by = "SampleID", all.x = TRUE, sort = FALSE)
+scr_sites$Bray_Group <- factor(scr_sites$Bray_Group)
+
+get_pc_labels <- function(mod) {
+  if (!is.null(mod$CCA) && !is.null(mod$CCA$eig)) eig <- mod$CCA$eig
+  else if (!is.null(mod$CA) && !is.null(mod$CA$eig)) eig <- mod$CA$eig
+  else eig <- NULL
+  if (!is.null(eig) && length(eig) >= 2 && sum(eig) > 0) {
+    pc1 <- round(100 * eig[1] / sum(eig), 1); pc2 <- round(100 * eig[2] / sum(eig), 1)
+  } else { pc1 <- NA; pc2 <- NA }
+  list(
+    xlab = if (is.na(pc1)) "RDA1" else paste0("RDA1 (", pc1, "%)"),
+    ylab = if (is.na(pc2)) "RDA2" else paste0("RDA2 (", pc2, "%)")
+  )
+}
+labs_pc <- get_pc_labels(rda_mod)
+
+bray_cols <- c("I"="pink","II"="saddlebrown","III"="#3B5DFF","IV"="skyblue",
+               "V"="green3","VI"="goldenrod1","VII"="#D55E00","VIII"="red")
+levs <- levels(scr_sites$Bray_Group)
+bray_cols_use <- bray_cols[intersect(names(bray_cols), levs)]
+if (length(bray_cols_use) < length(levs)) {
+  missing_lvls <- setdiff(levs, names(bray_cols_use))
+  add_cols <- rep("grey60", length(missing_lvls)); names(add_cols) <- missing_lvls
+  bray_cols_use <- c(bray_cols_use, add_cols)
+}
+
+p_biplot <- ggplot() +
+  geom_hline(yintercept = 0, linetype = 3, color = "grey70") +
+  geom_vline(xintercept = 0, linetype = 3, color = "grey70") +
+  geom_point(
+    data = scr_sites,
+    aes(x = RDA1, y = RDA2, fill = Bray_Group),
+    shape = 21, color = "black", size = 2.4, alpha = 0.9
+  ) +
+  ggrepel::geom_text_repel(
+    data = scr_sites,
+    aes(x = RDA1, y = RDA2, label = SampleID),
+    color = "black", size = 2.8, show.legend = FALSE, max.overlaps = 30
+  ) +
+  scale_fill_manual(values = bray_cols_use, na.value = "grey80", name = "Bray Group") +
+  geom_segment(
+    data = scr_vars,
+    aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+    arrow = grid::arrow(length = unit(0.18,"cm")),
+    color = "red", linewidth = 0.6
+  ) +
+  geom_text(
+    data = scr_vars,
+    aes(x = RDA1*1.07, y = RDA2*1.07, label = Var),
+    color = "red", size = 3
+  ) +
+  labs(
+    title = "RDA (Hellinger) – community vs environment",
+    x = labs_pc$xlab, y = labs_pc$ylab
+  ) +
+  theme_minimal(base_size = 12)
+print(p_biplot)
+# ggsave("RDA_biplot_with_labels.png", p_biplot, width = 8, height = 6, dpi = 300)
