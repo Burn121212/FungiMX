@@ -1,9 +1,9 @@
 # =====================================================================
-# Aguila et al. — Analysis Script (reviewer-friendly, documented)
+# Aguila et al. 2025 — Analysis Script for MS Diversity and distribution of soil fungi in Neotropical Mexican forests
 # Packages: phyloseq, vegan, ampvis2, indicspecies, ggplot2, etc.
 # This script builds a phyloseq object, explores beta/alpha diversity,
 # renders relative-abundance barplots, and generates ampvis2 heatmap
-# and PCA. Minor safe fixes were applied (see notes above).
+# and PCA. NMDS, RDA + Hellinger.
 # =====================================================================
 
 # ----------------------------
